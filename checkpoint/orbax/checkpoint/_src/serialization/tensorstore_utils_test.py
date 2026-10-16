@@ -1100,6 +1100,100 @@ class BuildArrayTSpecForWriteTest(parameterized.TestCase):
     self.assertTrue(ts_utils.is_remote_storage(nested_grpc_tspec))
 
 
+class GcsfuseDetectionTest(parameterized.TestCase):
+  """Tests detection of local paths served by a gcsfuse mount."""
+
+  def setUp(self):
+    super().setUp()
+    self.directory = self.create_tempdir().full_path
+    ts_utils._fs_type_for_device.cache_clear()
+    self.addCleanup(ts_utils._fs_type_for_device.cache_clear)
+
+  def _fake_mountinfo(self, fs_type: str) -> None:
+    """Points `_MOUNTINFO_PATH` at a mountinfo serving `self.directory`."""
+    dev = os.stat(self.directory).st_dev
+    mountinfo = self.create_tempfile(
+        content=(
+            '22 1 0:1 / / rw,relatime - ext4 /dev/root rw\n'
+            f'1462 22 {os.major(dev)}:{os.minor(dev)} / {self.directory}'
+            f' rw,nosuid,nodev,relatime - {fs_type} my-bucket'
+            ' rw,user_id=0,group_id=0,default_permissions\n'
+        )
+    )
+    self.enter_context(
+        unittest.mock.patch.object(
+            ts_utils, '_MOUNTINFO_PATH', mountinfo.full_path
+        )
+    )
+
+  @parameterized.named_parameters(
+      # gcsfuse CLI, `mount -t gcsfuse` and /etc/fstab mounts.
+      dict(testcase_name='gcsfuse', fs_type='fuse.gcsfuse', expected=True),
+      # GKE Cloud Storage FUSE CSI driver mounts (no FUSE subtype).
+      dict(testcase_name='gke_csi_fuse', fs_type='fuse', expected=True),
+      dict(testcase_name='ext4', fs_type='ext4', expected=False),
+      dict(testcase_name='other_fuse', fs_type='fuse.sshfs', expected=False),
+  )
+  def test_is_gcsfuse_path(self, fs_type: str, expected: bool):
+    self._fake_mountinfo(fs_type)
+
+    self.assertEqual(ts_utils._is_gcsfuse_path(self.directory), expected)
+
+  def test_not_yet_created_path_uses_existing_ancestor(self):
+    self._fake_mountinfo('fuse.gcsfuse')
+
+    self.assertTrue(
+        ts_utils._is_gcsfuse_path(
+            os.path.join(self.directory, 'new_step', 'new_item')
+        )
+    )
+
+  def test_missing_mountinfo_is_not_gcsfuse(self):
+    self.enter_context(
+        unittest.mock.patch.object(
+            ts_utils,
+            '_MOUNTINFO_PATH',
+            os.path.join(self.directory, 'missing_mountinfo'),
+        )
+    )
+
+    self.assertFalse(ts_utils._is_gcsfuse_path(self.directory))
+
+  @parameterized.named_parameters(
+      dict(testcase_name='gcsfuse', fs_type='fuse.gcsfuse', expected=True),
+      dict(testcase_name='ext4', fs_type='ext4', expected=False),
+  )
+  def test_is_remote_storage_for_file_driver(
+      self, fs_type: str, expected: bool
+  ):
+    self._fake_mountinfo(fs_type)
+
+    self.assertEqual(
+        ts_utils.is_remote_storage(
+            {'driver': 'file', 'path': os.path.join(self.directory, 'ckpt')}
+        ),
+        expected,
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name='gcsfuse', fs_type='fuse.gcsfuse', expected=True),
+      dict(testcase_name='ext4', fs_type='ext4', expected=False),
+  )
+  def test_build_kvstore_tspec_read_coalescing(
+      self, fs_type: str, expected: bool
+  ):
+    self._fake_mountinfo(fs_type)
+
+    kvstore_tspec = ts_utils.build_kvstore_tspec(
+        self.directory, name='ckpt', use_ocdbt=True
+    )
+
+    self.assertEqual(
+        'experimental_read_coalescing_threshold_bytes' in kvstore_tspec,
+        expected,
+    )
+
+
 class BuildArrayTSpecForReadTest(parameterized.TestCase):
 
   def setUp(self):

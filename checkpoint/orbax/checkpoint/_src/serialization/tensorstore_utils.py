@@ -19,7 +19,7 @@ from collections.abc import Sequence
 import copy
 import dataclasses
 import enum
-
+import functools
 import json
 import math
 import os
@@ -911,11 +911,71 @@ class ArrayWriteSpec:
     return self._metadata
 
 
+_MOUNTINFO_PATH = '/proc/self/mountinfo'
+# Filesystem types that Cloud Storage FUSE (gcsfuse) mounts report in
+# mountinfo. `fuse.gcsfuse` is used when the gcsfuse binary mounts the bucket
+# itself (CLI, `mount -t gcsfuse`, /etc/fstab). The GKE Cloud Storage FUSE CSI
+# driver mounts `/dev/fuse` on behalf of its gcsfuse sidecar, so those mounts
+# report plain `fuse` without a subtype.
+_GCSFUSE_FS_TYPES = frozenset({'fuse.gcsfuse', 'fuse'})
+
+
+@functools.lru_cache(maxsize=64)
+def _fs_type_for_device(dev: int) -> str | None:
+  """Returns the filesystem type of the mount for device `dev`, if known."""
+  device_id = f'{os.major(dev)}:{os.minor(dev)}'
+  try:
+    with open(_MOUNTINFO_PATH) as f:
+      for line in f:
+        # Format: id parent major:minor root mount_point ... - fs_type source
+        mount_fields, _, fs_fields = line.partition(' - ')
+        mount_fields, fs_fields = mount_fields.split(), fs_fields.split()
+        if len(mount_fields) > 2 and fs_fields and (
+            mount_fields[2] == device_id
+        ):
+          return fs_fields[0]
+  except OSError:
+    pass
+  return None
+
+
+def _is_gcsfuse_path(path: str) -> bool:
+  """Returns True if local `path` is served by a gcsfuse mount.
+
+  Paths on a gcsfuse mount are backed by GCS objects, so every read becomes a
+  ranged GCS request and benefits from the same read coalescing as `gs://`
+  paths. The mount is identified by the device number of `path` rather than by
+  path prefix, so symlinks, bind mounts and nested mounts are handled by the
+  kernel.
+
+  Args:
+    path: Local filesystem path. If it does not exist yet, its nearest existing
+      ancestor is used.
+
+  Returns:
+    True if `path` is on a gcsfuse mount; False otherwise, including when the
+    mount table is unavailable (e.g. on non-Linux platforms).
+  """
+  path = os.path.abspath(path)
+  while True:
+    try:
+      dev = os.stat(path).st_dev
+      break
+    except FileNotFoundError:
+      parent = os.path.dirname(path)
+      if parent == path:
+        return False
+      path = parent
+    except OSError:
+      return False
+  return _fs_type_for_device(dev) in _GCSFUSE_FS_TYPES
+
+
 def is_remote_storage(tspec: dict[str, Any] | str) -> bool:
   """Detect if user is using remote storages.
 
-  This can detect common defines and unable to detect some corner cases such as
-  using gcsfuse.
+  This detects `gs://` / `s3://` URLs, remote kvstore drivers, and `file`
+  driver paths on a gcsfuse mount.
 
   Args:
     tspec: Tensorstore spec.
@@ -925,16 +985,15 @@ def is_remote_storage(tspec: dict[str, Any] | str) -> bool:
   """
   if isinstance(tspec, str):
     # KvStoreUrl
-    if re.match(rf'^({"|".join(_REMOTE_URL_PREFIXES)})', tspec):
-      return True
-    else:
-      return False
+    return bool(re.match(rf'^({"|".join(_REMOTE_URL_PREFIXES)})', tspec))
 
   for key in ('base', 'kvstore'):
     if key in tspec:
       return is_remote_storage(tspec[key])
 
   if 'driver' in tspec:
+    if tspec['driver'] == 'file' and isinstance(tspec.get('path'), str):
+      return _is_gcsfuse_path(tspec['path'])
     for rule in _REMOTE_DRIVER_VALIDATIONS:
       if tspec['driver'] == rule['driver']:
         if rule['path_regex'] is None:
